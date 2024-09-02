@@ -1,0 +1,690 @@
+# SQL Database Creation for Air Quality Data
+
+This repository contains scripts to fetch and store air quality data from various sensors located across Washington D.C. into four separate SQL databases. The code ensures that data retrieval starts from the last timestamp in the databases to avoid duplication or repetition.
+
+## 1. Purple Air Sensors
+
+This script fetches data from Purple Air sensors and stores it in an SQLite database
+
+import requests
+import sqlite3
+import datetime
+import time
+import os
+from os.path import isfile
+import pytz
+
+### Define folder variable (example value, adjust as needed)
+folder = r"S:\Aqddata2\Air Quality Planning Branch\Monitoring Data Analysis\Air Sensors Databases"
+
+### Use a consistent database name
+sql_database = os.path.join(folder, "PurpleAirDB.sqlite")
+
+### Print current working directory
+print(os.getcwd())
+
+### Define exponential backoff for API requests
+def fetch_data_with_backoff(url, headers, params, max_retries=5):
+    wait_time = 1  # Initial wait time in seconds
+    for attempt in range(max_retries):
+        response = requests.get(url, headers=headers, params=params, verify=False)  # Disabled SSL verification
+        if response.status_code == 200:
+            return response.json()  # Success
+        elif response.status_code == 429:
+            print(f"Rate limit exceeded, retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+            wait_time *= 2  # Exponential backoff
+        else:
+            response.raise_for_status()  # Handle other errors.
+    raise Exception(f"Failed to fetch data after {max_retries} retries.")
+
+### Batch insert into SQLite database
+def insert_data(db_name, insert_query, data):
+    with sqlite3.connect(db_name) as conn:
+        cursor = conn.cursor()
+        cursor.executemany(insert_query, data)
+        conn.commit()
+
+### Save the last fetched datetime
+def save_last_fetched_datetime(db_name, datetime_str):
+    with sqlite3.connect(db_name) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO Metadata (key, value) VALUES ('last_fetched_datetime', ?)", (datetime_str,))
+        conn.commit()
+
+### Load the last fetched datetime
+def load_last_fetched_datetime(db_name):
+    with sqlite3.connect(db_name) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM Metadata WHERE key = 'last_fetched_datetime'")
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+        return "06/04/2024 16:00"  # Default start datetime in MM/DD/YYYY HH:MM format
+
+### API and Database Configuration
+api_key = "ABC....."
+group_id = "2239"
+member_ids = [203605, 203611, 203610, 203609, 203608, 203612]
+member_location = {
+    203605: (38.89677, -76.95342),
+    203611: (38.89477, -76.95142),
+    203610: (38.89477, -76.95242),
+    203609: (38.89477, -76.95342),
+    203608: (38.89577, -76.95342),
+    203612: (38.89477, -76.950424)
+}
+base_url_template = "https://api.purpleair.com/v1/groups/{group_id}/members/{member_id}/history"
+headers = {'X-API-Key': api_key}
+params_template = {
+    'average': 60,  # 1 hour average
+    'fields': "humidity, temperature, pressure, pm1.0_atm, pm2.5_atm, pm10.0_atm"
+}
+
+insert_query = '''
+INSERT INTO PurpleAir_history (member_id, date, time, latitude, longitude, humidity, temperature, pressure, pm1_0_atm, pm2_5_atm, pm10_0_atm) 
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+'''
+
+### Main script to fetch and insert data
+def main():
+    last_fetched_datetime = load_last_fetched_datetime(sql_database)
+    eastern = pytz.timezone('US/Eastern')
+    start_datetime = datetime.datetime.strptime(last_fetched_datetime, "%m/%d/%Y %H:%M")
+    start_datetime = eastern.localize(start_datetime)  # Make start_datetime timezone-aware
+    end_datetime = datetime.datetime.now(eastern)  # Fetch until the current time
+
+    all_data = []  # To collect data from all member IDs
+
+    print(f"Fetching data from {start_datetime} to {end_datetime}")
+
+    try:
+        while start_datetime < end_datetime:
+            start_timestamp = int(start_datetime.timestamp())
+            next_datetime = start_datetime + datetime.timedelta(days=1)
+            end_timestamp = int(next_datetime.timestamp()) if next_datetime < end_datetime else int(end_datetime.timestamp())
+            params_template['start_timestamp'] = start_timestamp
+            params_template['end_timestamp'] = end_timestamp
+
+            for member_id in member_ids:
+                base_url = base_url_template.format(group_id=group_id, member_id=member_id)
+                params = params_template.copy()  # Create a fresh copy of params for each member ID
+                latitude, longitude = member_location[member_id]  # Get the location for the current member ID
+
+                print(f"Fetching data for member_id {member_id} from {start_datetime} to {next_datetime}")
+
+                try:
+                    data = fetch_data_with_backoff(base_url, headers, params)
+                    if 'data' in data:
+                        print(f"Fetched {len(data['data'])} entries for member_id {member_id}")
+                        for entry in data['data']:
+                            timestamp = entry[0]
+                            dt = datetime.datetime.fromtimestamp(timestamp, eastern)
+                            date = dt.strftime('%m/%d/%Y')
+                            time_str = dt.strftime('%H:%M')  # Format time as HH:MM
+                            row = (
+                                member_id,
+                                date,
+                                time_str,
+                                latitude,
+                                longitude,
+                                round(entry[1], 2),  # humidity
+                                round(entry[2], 2),  # temperature
+                                round(entry[3], 2),  # pressure
+                                round(entry[4], 2),  # pm1_0_atm
+                                round(entry[5], 2),  # pm2_5_atm
+                                round(entry[6], 2)   # pm10_0_atm
+                            )
+                            all_data.append(row)
+                except Exception as e:
+                    print(f"An error occurred for member_id {member_id}: {e}")
+
+            start_datetime += datetime.timedelta(days=1)
+
+        #### Sort data by date and time before insertion
+        all_data.sort(key=lambda x: (x[1], x[2]))
+
+        #### Insert collected data into the database
+        if all_data:
+            insert_data(sql_database, insert_query, all_data)
+            print("Data inserted successfully.")
+            last_entry = all_data[-1]
+            last_fetched_datetime = f"{last_entry[1]} {last_entry[2]}"
+            save_last_fetched_datetime(sql_database, last_fetched_datetime)
+        else:
+            print("No data to insert.")
+    except Exception as e:
+        print(f"An error occurred during data fetching and insertion: {e}")
+
+### Create the SQLite database table if it doesn't exist
+def create_db_table():
+    with sqlite3.connect(sql_database) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS PurpleAir_history (
+            member_id INTEGER,
+            date TEXT,
+            time TEXT,
+            latitude REAL,
+            longitude REAL,
+            humidity REAL,
+            temperature REAL,
+            pressure REAL,
+            pm1_0_atm REAL,
+            pm2_5_atm REAL,
+            pm10_0_atm REAL
+        );
+        ''')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS Metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_date_time ON PurpleAir_history (date, time);')
+
+### Function to retrieve data ordered by date and time
+def retrieve_data(db_name):
+    with sqlite3.connect(db_name) as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM PurpleAir_history ORDER BY date, time')
+        rows = cursor.fetchall()
+        for row in rows:
+            print(row)
+
+if __name__ == "__main__":
+    if not isfile(sql_database):
+        create_db_table()
+    main()
+    retrieve_data(sql_database)
+
+## 2. Clarity Nodes
+
+This script fetches data from Clarity sensors and stores it in an SQLite database
+
+import requests
+import datetime
+import pandas as pd
+import sqlite3
+from time import sleep
+from datetime import timezone
+import pytz
+
+### Setup your API key and base URL for Clarity API
+clarity_api_key = 'EFG......'
+clarity_api_base_url = 'https://clarity-data-api.clarity.io'
+
+def create_connection(db_file):
+    """ create a database connection to a SQLite database """
+    conn = None
+    try:
+        conn = sqlite3.connect(db_file)
+        return conn
+    except Exception as e:
+        print(e)
+    return conn
+
+def create_table(conn):
+    """ create a table to store data """
+    try:
+        sql_create_table = """ CREATE TABLE IF NOT EXISTS Clarity_History (
+                                    nodeId TEXT,
+                                    end_period TEXT,
+                                    date TEXT,
+                                    time TEXT,
+                                    latitude REAL,
+                                    longitude REAL,
+                                    NO2 REAL,
+                                    PM1 REAL,
+                                    PM2_5 REAL,
+                                    PM10 REAL,
+                                    humidity_internal REAL
+                                ); """
+        cur = conn.cursor()
+        cur.execute(sql_create_table)
+    except Exception as e:
+        print(e)
+
+def get_last_entry_time(conn):
+    """ Get the last end_period entry from the database """
+    sql = '''SELECT MAX(end_period) FROM Clarity_History'''
+    cur = conn.cursor()
+    cur.execute(sql)
+    result = cur.fetchone()
+    return result[0]
+
+def insert_data(conn, data):
+    """ Insert data into the table """
+    sql = ''' INSERT INTO Clarity_History(nodeId, end_period, date, time, latitude, longitude, NO2, PM1, PM2_5, PM10, humidity_internal)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?) '''
+    cur = conn.cursor()
+    cur.executemany(sql, data)
+    conn.commit()
+
+def request_and_fetch_a_report():
+    headers = {"x-api-key": clarity_api_key}
+    
+    db_file = r"S:\Aqddata2\Air Quality Planning Branch\Monitoring Data Analysis\Air Sensors Databases\ClarityDB.sqlite"
+    conn = create_connection(db_file)
+    create_table(conn)
+    
+    last_entry_time = get_last_entry_time(conn)
+    if last_entry_time:
+        start_time = datetime.datetime.strptime(last_entry_time, '%Y-%m-%dT%H:%M:%S%z')
+    else:
+        start_time = datetime.datetime(2024, 6, 4, tzinfo=timezone.utc)
+
+    end_time = datetime.datetime.now(timezone.utc)
+
+    payload = {
+        "org": "dcdoee3MXW",
+        "report": "node-measurements",
+        "nodeIds": ["A7NGCMJM", "APVP3YHR"],
+        "outputFrequency": "hour",
+        "startTime": start_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "endTime": end_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "metricLabelStyle": "english"
+    }
+
+    result = requests.post(
+        url=clarity_api_base_url + "/v2/report-requests",
+        headers=headers,
+        json=payload,
+        verify=False
+    )
+
+    try:
+        result.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        print("Failed to submit report request:")
+        print(result.text)
+        raise SystemExit(e)
+
+    result_json = result.json()
+    reportId = result_json['reportId']
+
+    for i in range(12):
+        print(f"Sleeping for 1 minute, iteration {i+1}")
+        sleep(60)
+        print("Fetching report status ... ", end="")
+        status_url = clarity_api_base_url + f"/v2/report-requests/{reportId}"
+        status_result = requests.get(url=status_url, headers=headers, verify=False)
+        status_result.raise_for_status()
+        status_json = status_result.json()
+        report_status = status_json.get("reportStatus")
+        print(report_status)
+        if report_status != 'in-progress':
+            break
+
+    if status_json.get("reportStatus") == 'succeeded':
+        for url in status_json.get('urls', []):
+            with requests.get(url=url, stream=True, verify=False) as file_result:
+                file_result.raise_for_status()
+                data = pd.read_csv(file_result.raw, compression='gzip')
+                data = data[['nodeId', 'End of Period', 'Location Latitude [deg]', 'Location Longitude [deg]', 
+                             'NO2 concentration, 1-hour mean value', 'PM1 mass concentration, 1-hour mean value' ,'PM2.5 mass concentration, 1-hour mean value', 
+                             'PM10 mass concentration, 1-hour mean value', 'Relative humidity internal, 1-hour mean value']]
+                data.columns = ['nodeId', 'end_period', 'latitude', 'longitude', 'NO2', 'PM1', 'PM2_5', 'PM10', 'humidity_internal']
+                
+                #### Convert to Eastern Standard Time (EST)
+                data['end_period'] = pd.to_datetime(data['end_period']).dt.tz_convert('UTC').dt.tz_convert('US/Eastern')
+                
+                #### Filter out data before 06/04/2024, 00:00 EST
+                data = data[data['end_period'] >= pd.Timestamp('2024-06-04T00:00:00', tz='US/Eastern')]
+                
+                #### Create new date and time columns
+                data['date'] = data['end_period'].dt.strftime('%m/%d/%Y')
+                data['time'] = data['end_period'].dt.strftime('%H:%M')
+                
+                #### Convert end_period to string
+                data['end_period'] = data['end_period'].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+                
+                #### Reorder columns
+                data = data[['nodeId', 'end_period', 'date', 'time', 'latitude', 'longitude', 'NO2', 'PM1', 'PM2_5', 'PM10', 'humidity_internal']]
+
+                insert_data(conn, data.values.tolist())
+        conn.close()
+        print("Data inserted into SQLite database successfully.")
+
+## 3. EPA sensors
+
+This script fetches data from EPA sensors and stores it in an SQLite database
+
+import os
+import requests
+from datetime import timedelta, datetime
+import sqlite3
+
+def create_database(conn):
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS AirNowHistory (
+            site TEXT,
+            date TEXT,
+            hour TEXT,
+            ozone REAL,
+            pm REAL,
+            NO2 REAL,
+            BC REAL,
+            RHUM REAL,
+            RWS REAL,
+            SO2 REAL,
+            BARPR REAL,
+            RWD REAL,
+            TEMP REAL,
+            CO REAL,
+            PRECIP REAL,
+            latitude REAL,
+            longitude REAL,
+            UNIQUE(site, date, hour)
+        )
+    ''')
+    conn.commit()
+
+def get_last_recorded_date(c):
+    c.execute('SELECT site, date, hour FROM AirNowHistory ORDER BY date DESC, hour DESC LIMIT 1')
+    return c.fetchone()
+
+def initialize_air_quality_data(sites):
+    return {site: {
+        "dates": [],
+        "hour": [],
+        "ozone": [],
+        "pm": [],
+        "NO2": [],
+        "BC": [],
+        "RHUM": [],
+        "RWS": [],
+        "SO2": [],
+        "BARPR": [],
+        "RWD": [],
+        "TEMP": [],
+        "CO": [],
+        "PRECIP": [],
+        "latitude": lat,
+        "longitude": lon
+    } for site, (lat, lon) in sites.items()}
+
+def process_file_content(content, air_quality_data, sites, measurements):
+    lines = content.splitlines()
+    for line in lines:
+        for site in sites:
+            if site in line:
+                parts = line.split('|')
+                date, hour_formatted = parts[0], parts[1]
+                added = False
+
+                if not added and (len(air_quality_data[site]["dates"]) == 0 or
+                                  air_quality_data[site]["dates"][-1] != date or
+                                  air_quality_data[site]["hour"][-1] != hour_formatted):
+                    air_quality_data[site]["dates"].append(date)
+                    air_quality_data[site]["hour"].append(hour_formatted)
+                    added = True
+
+                for meas, field in measurements.items():
+                    if meas in line:
+                        air_quality_data[site][field].append(float(parts[7]))
+
+def insert_data_into_db(c, air_quality_data):
+    for site, measurements in air_quality_data.items():
+        num_entries = len(measurements['dates'])
+        for i in range(num_entries):
+            row = [
+                site, measurements['dates'][i],
+                measurements['hour'][i] if i < len(measurements["hour"]) else None,
+                measurements['ozone'][i] if i < len(measurements['ozone']) else None,
+                measurements['pm'][i] if i < len(measurements['pm']) else None,
+                measurements['NO2'][i] if i < len(measurements['NO2']) else None,
+                measurements['BC'][i] if i < len(measurements['BC']) else None,
+                measurements['RHUM'][i] if i < len(measurements['RHUM']) else None,
+                measurements['RWS'][i] if i < len(measurements['RWS']) else None,
+                measurements['SO2'][i] if i < len(measurements['SO2']) else None,
+                measurements['BARPR'][i] if i < len(measurements['BARPR']) else None,
+                measurements['RWD'][i] if i < len(measurements['RWD']) else None,
+                measurements['TEMP'][i] if i < len(measurements['TEMP']) else None,
+                measurements['CO'][i] if i < len(measurements['CO']) else None,
+                measurements['PRECIP'][i] if i < len(measurements['PRECIP']) else None,
+                measurements['latitude'],
+                measurements['longitude']
+            ]
+            try:
+                c.execute('INSERT OR IGNORE INTO AirNowHistory VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', row)
+            except sqlite3.IntegrityError:
+                print(f"Duplicate entry found for {site} on {measurements['dates'][i]} at {measurements['hour'][i]}")
+
+def main():
+    verificationpath = r"S:\Aqddata2\Air Quality Planning Branch\Monitoring Data Analysis\Air Sensors Databases"
+    initial_startdate = datetime(2024, 6, 5, 0, 0)
+    dc_sites = {
+        "RIVER_Terrace": (38.895572, -76.958072),
+        "McMillan Reservoir": (38.921847, -77.013178),
+        "DCNearRoad": (38.894770, -76.953426),
+        "TakomaRec": (38.970092, -77.016715),
+        "King Greenleaf Rec C": (38.875161, -77.012816),
+        "Bald Eagle": (38.8187243, -77.0102537)
+    }
+    measurements = {"OZONE": "ozone", "PM2.5": "pm", "NO2": "NO2", "BC": "BC",
+                    "RHUM": "RHUM", "RWS": "RWS", "SO2": "SO2", "BARPR": "BARPR",
+                    "RWD": "RWD", "TEMP": "TEMP", "CO": "CO", "PRECIP": "PRECIP"}
+
+    db_path = os.path.join(verificationpath, 'AirNowDB.sqlite')
+    print(f"Database path: {db_path}")
+    
+    if not os.path.exists(verificationpath):
+        print(f"The directory {verificationpath} does not exist.")
+        return
+    
+    if not os.access(verificationpath, os.W_OK):
+        print(f"The directory {verificationpath} is not writable.")
+        return
+    
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.OperationalError as e:
+        print(f"Error connecting to database: {e}")
+        return
+
+    create_database(conn)
+    c = conn.cursor()
+    last_record = get_last_recorded_date(c)
+
+    if last_record:
+        last_site, last_date_str, last_hour_str = last_record
+        try:
+            startdate = datetime.strptime(last_date_str + last_hour_str, "%m/%d/%y%H:%M")
+        except ValueError as ve:
+            print(f"Date format error: {ve}")
+            startdate = initial_startdate
+    else:
+        startdate = initial_startdate
+
+    air_quality_data = initialize_air_quality_data(dc_sites)
+    enddate = datetime.now()
+    current_date_time = startdate + timedelta(hours=1)
+
+    while current_date_time <= enddate:
+        str_date = current_date_time.strftime("%Y%m%d")
+        year = current_date_time.strftime("%Y")
+        hour = current_date_time.strftime("%H")
+        filename = f"HourlyData_{str_date}{hour}.dat"
+        remote_url = f"https://s3-us-west-1.amazonaws.com/files.airnowtech.org/airnow/{year}/{str_date}/{filename}"
+
+        try:
+            response = requests.get(remote_url)
+            response.raise_for_status()
+            print(f"Downloaded {filename} for {str_date}")
+            process_file_content(response.text, air_quality_data, dc_sites, measurements)
+        except requests.exceptions.RequestException as e:
+            print(f"Could not download data for {str_date}: {e}")
+        except Exception as e:
+            print(f"Could not process {filename} because of: {e}")
+
+        current_date_time += timedelta(hours=1)
+
+    insert_data_into_db(c, air_quality_data)
+    conn.commit()
+    conn.close()
+
+    print("Database has been created and data has been inserted.")
+
+if __name__ == "__main__":
+    main()
+
+if __name__ == "__main__":
+    request_and_fetch_a_report()
+
+
+## 4. QuantAQ Sensors
+
+This script fetches data from EPA sensors and stores it in an SQLite database
+
+import os
+import requests
+from requests.auth import HTTPBasicAuth
+from datetime import datetime, timedelta
+import pytz
+import sqlite3
+from dateutil import parser
+
+### Set up the API key and base URL
+api_key = 'XYZ........'
+base_url = 'https://api.quant-aq.com/v1/'
+
+### Define the device serial number
+serial_number = 'MOD-00734'  # Replace with your actual serial number
+
+### Set up time variables
+utc_tz = pytz.utc
+eastern_tz = pytz.timezone('US/Eastern')
+
+### Define the directory where the script and database should be saved
+output_directory = r'Z:\Air Quality Planning Branch\Monitoring Data Analysis\Air Sensors Databases'
+
+### Ensure the directory exists (creates it if it doesn't exist)
+os.makedirs(output_directory, exist_ok=True)
+
+### Define the path for the SQLite database
+database_path = os.path.join(output_directory, 'QuantAQDB.sqlite')
+
+### Initialize SQLite database
+print("Connecting to the database...")
+conn = sqlite3.connect(database_path)
+print("Connected to database at:", database_path)
+cursor = conn.cursor()
+
+### Create a table if it doesn't exist
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS QuantAQ_History (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sn TEXT,
+        date TEXT,
+        time TEXT,
+        timestamp_utc TEXT,
+        timestamp_eastern TEXT,
+        PM1 REAL,
+        PM25 REAL,
+        PM10 REAL,
+        CO REAL,
+        NO REAL,
+        NO2 REAL,
+        O3 REAL
+    )
+''')
+
+### Determine the last fetched timestamp
+cursor.execute('SELECT MAX(timestamp_utc) FROM QuantAQ_History WHERE sn = ?', (serial_number,))
+last_fetched_timestamp = cursor.fetchone()[0]
+
+if last_fetched_timestamp:
+    start_time_utc = parser.isoparse(last_fetched_timestamp)
+else:
+    #### If no data exists, start from 3 days ago
+    start_time_utc = utc_tz.localize(datetime.utcnow()) - timedelta(days=3)
+
+### Current time in UTC (timezone-aware)
+end_time_utc = utc_tz.localize(datetime.utcnow())
+
+def fetch_and_store_data_for_time_range():
+    url = f'{base_url}data/resampled/'
+    params = {
+        "sn": serial_number,
+        "period": "1h",
+        "start_date": start_time_utc.strftime('%Y-%m-%d'),
+        "end_date": end_time_utc.strftime('%Y-%m-%d')
+    }
+    
+    try:
+        response = requests.get(url, auth=HTTPBasicAuth(api_key, ''), params=params)
+        print(f"API response status: {response.status_code}")  # Check the response status code
+        
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            print(f"Number of records fetched: {len(data)}")
+            
+            if not data:
+                print(f"No data found for the specified time range.")
+            else:
+                for item in data:
+                    timestamp_str = item.get('period_end_utc')
+                    
+                    #### Use dateutil.parser to handle the timezone-aware string
+                    timestamp = parser.isoparse(timestamp_str)
+                    
+                    print(f"Processing timestamp: {timestamp}")
+                    
+                    #### Only process data within the range of interest (ignore future data)
+                    if start_time_utc <= timestamp <= end_time_utc:
+                        #### Check if the record already exists in the database
+                        cursor.execute('''
+                            SELECT COUNT(*) FROM QuantAQ_History WHERE sn = ? AND timestamp_utc = ?
+                        ''', (serial_number, timestamp_str))
+                        count = cursor.fetchone()[0]
+                        
+                        if count == 0:  # Record does not exist, so insert it
+                            print("Record does not exist in the database. Preparing to insert data.")
+                            eastern_time = timestamp.astimezone(eastern_tz)
+                            
+                            #### Format the date and time
+                            date_str = eastern_time.strftime('%m/%d/%Y')
+                            time_str = eastern_time.strftime('%H:%M:%S')
+                            
+                            record = (
+                                serial_number,
+                                date_str,
+                                time_str,
+                                timestamp_str,
+                                eastern_time.strftime('%Y-%m-%d %H:%M:%S'),
+                                item.get('pm1'),
+                                item.get('pm25'),
+                                item.get('pm10'),
+                                item.get('co'),
+                                item.get('no'),
+                                item.get('no2'),
+                                item.get('o3')
+                            )
+                            
+                            print(f"Inserting record: {record}")
+                            
+                            cursor.execute('''
+                                INSERT INTO QuantAQ_History (
+                                    sn, date, time, timestamp_utc, timestamp_eastern, PM1, PM25, PM10, CO, NO, NO2, O3
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', record)
+                
+                #### Commit the transaction
+                conn.commit()
+                print(f"Data successfully inserted into the SQLite database.")
+        
+        else:
+            print(f"Failed to retrieve data: {response.status_code} - {response.text}")
+    
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
+
+### Ensure the function is being called
+print("Starting data fetching process...")
+fetch_and_store_data_for_time_range()
+print("Data fetching process completed.")
+
+### Close the database connection
+conn.close()
