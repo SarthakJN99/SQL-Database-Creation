@@ -67,12 +67,12 @@ api_key = "ABC....."
 group_id = "2239"
 member_ids = [203605, 203611, 203610, 203609, 203608, 203612]
 member_location = {
-    203605: (38.89677, -76.95342),
-    203611: (38.89477, -76.95142),
-    203610: (38.89477, -76.95242),
-    203609: (38.89477, -76.95342),
-    203608: (38.89577, -76.95342),
-    203612: (38.89477, -76.950424)
+    203605: (38, -76),
+    203611: (38, -76),
+    203610: (38, -76),
+    203609: (38, -76),
+    203608: (38, -76),
+    203612: (38, -76)
 }
 base_url_template = "https://api.purpleair.com/v1/groups/{group_id}/members/{member_id}/history"
 headers = {'X-API-Key': api_key}
@@ -279,7 +279,7 @@ def request_and_fetch_a_report():
     payload = {
         "org": "dcdoee3MXW",
         "report": "node-measurements",
-        "nodeIds": ["A7NGCMJM", "APVP3YHR"],
+        "nodeIds": ["1234", "5678"],
         "outputFrequency": "hour",
         "startTime": start_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "endTime": end_time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
@@ -456,12 +456,12 @@ def main():
     verificationpath = r"S:\Aqddata2\Air Quality Planning Branch\Monitoring Data Analysis\Air Sensors Databases"
     initial_startdate = datetime(2024, 6, 5, 0, 0)
     dc_sites = {
-        "RIVER_Terrace": (38.895572, -76.958072),
-        "McMillan Reservoir": (38.921847, -77.013178),
-        "DCNearRoad": (38.894770, -76.953426),
-        "TakomaRec": (38.970092, -77.016715),
-        "King Greenleaf Rec C": (38.875161, -77.012816),
-        "Bald Eagle": (38.8187243, -77.0102537)
+        "RIVER_Terrace": (38, -76),
+        "McMillan Reservoir": (38, -77),
+        "DCNearRoad": (38, -76),
+        "TakomaRec": (38, -77),
+        "King Greenleaf Rec C": (38, -77),
+        "Bald Eagle": (38, -77)
     }
     measurements = {"OZONE": "ozone", "PM2.5": "pm", "NO2": "NO2", "BC": "BC",
                     "RHUM": "RHUM", "RWS": "RWS", "SO2": "SO2", "BARPR": "BARPR",
